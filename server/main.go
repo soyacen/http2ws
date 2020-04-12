@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"github.com/cskr/pubsub"
 	"github.com/gorilla/websocket"
 	"http2ws/conf"
 	"http2ws/logger"
@@ -11,25 +12,28 @@ import (
 	"time"
 )
 
+const TOPIC = "topic"
+
 func StartServer() {
 	var wait sync.WaitGroup
-	msgChan := make(chan []byte)
+
+	ps := pubsub.New(0)
 
 	wait.Add(1)
-	startHttpServer(&wait, msgChan)
+	startHttpServer(&wait, ps)
 
 	wait.Add(1)
-	starWebsocketServer(&wait, msgChan)
+	starWebsocketServer(&wait, ps)
 
 	wait.Wait()
 	logger.Info("The server is shutting down。。。")
 }
 
-func startHttpServer(wg *sync.WaitGroup, msgChan chan []byte) {
+func startHttpServer(wg *sync.WaitGroup, ps *pubsub.PubSub) {
 	go func() {
 		defer wg.Done()
 		mux := http.NewServeMux()
-		mux.HandleFunc("/", serveHttp(msgChan))
+		mux.HandleFunc("/", serveHttp(ps))
 		server := http.Server{
 			Addr:    fmt.Sprintf(":%d", conf.HttpPort),
 			Handler: mux,
@@ -39,27 +43,20 @@ func startHttpServer(wg *sync.WaitGroup, msgChan chan []byte) {
 	}()
 }
 
-func serveHttp(msgChan chan []byte) func(http.ResponseWriter, *http.Request) {
+func serveHttp(ps *pubsub.PubSub) func(http.ResponseWriter, *http.Request) {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		msg, err := ioutil.ReadAll(request.Body)
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
-		go func(msg []byte) {
-			logger.Infof("server receive msg %s", msg)
-			select {
-			case msgChan <- msg:
-			case <-msgChan:
-				logger.Infof("server sweep msg %s", msg)
-				msgChan <- msg
-			}
-		}(msg)
+		logger.Infof("server receive msg %s", msg)
+		ps.TryPub(msg, TOPIC)
 		writer.WriteHeader(http.StatusNoContent)
 	}
 }
 
-func starWebsocketServer(wg *sync.WaitGroup, msgChan <-chan []byte) {
+func starWebsocketServer(wg *sync.WaitGroup, ps *pubsub.PubSub) {
 	go func() {
 		defer wg.Done()
 		var upgrader = websocket.Upgrader{
@@ -74,7 +71,7 @@ func starWebsocketServer(wg *sync.WaitGroup, msgChan <-chan []byte) {
 			},
 		}
 		mux := http.NewServeMux()
-		mux.HandleFunc("/", serveWs(msgChan, upgrader))
+		mux.HandleFunc("/", serveWs(ps, upgrader))
 		server := http.Server{
 			Addr:    fmt.Sprintf(":%d", conf.WebSocketPort),
 			Handler: mux,
@@ -85,7 +82,7 @@ func starWebsocketServer(wg *sync.WaitGroup, msgChan <-chan []byte) {
 
 }
 
-func serveWs(msgChan <-chan []byte, upgrader websocket.Upgrader) func(writer http.ResponseWriter, request *http.Request) {
+func serveWs(ps *pubsub.PubSub, upgrader websocket.Upgrader) func(writer http.ResponseWriter, request *http.Request) {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		logger.Info(request.RemoteAddr, " is new remote addr")
 		c, err := upgrader.Upgrade(writer, request, nil)
@@ -94,10 +91,12 @@ func serveWs(msgChan <-chan []byte, upgrader websocket.Upgrader) func(writer htt
 			http.Error(writer, err.Error(), http.StatusUpgradeRequired)
 			return
 		}
-		logger.Info("new remote addr is ",request.RemoteAddr)
+		logger.Info("new remote addr is ", request.RemoteAddr)
 		defer c.Close()
+		sub := ps.Sub(TOPIC)
+		defer ps.Unsub(sub, TOPIC)
 		for {
-			msg := <-msgChan
+			msg := (<-sub).([]byte)
 			logger.Info(request.RemoteAddr, " send msg ", string(msg))
 			err = c.WriteMessage(websocket.TextMessage, msg)
 			if err != nil {
@@ -106,5 +105,6 @@ func serveWs(msgChan <-chan []byte, upgrader websocket.Upgrader) func(writer htt
 			}
 			logger.Info(request.RemoteAddr, " send msg success")
 		}
+		logger.Info(request.RemoteAddr, "finish")
 	}
 }
