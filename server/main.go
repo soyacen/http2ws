@@ -18,6 +18,7 @@ func StartServer() {
 	var wait sync.WaitGroup
 
 	ps := pubsub.New(0)
+	defer ps.Shutdown()
 
 	wait.Add(1)
 	startHttpServer(&wait, ps)
